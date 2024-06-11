@@ -6,7 +6,7 @@
 #################################################################################
 {
     'name': 'Migration from other odoo',
-    "version": "1.0.0",
+    "version": "17.0.0.0",
     "author": "Anderson Martinez",
     "maintainer": "Anderson Martinez",
     'depends': ['account'],
