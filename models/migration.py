@@ -9,6 +9,8 @@ import datetime
 _log = logging.getLogger(__name__)
 import requests
 import base64
+from hashlib import sha256
+from json import dumps
 
 def get_chunks(iterable, n=1000):
     for i in range(0, len(iterable), int(n)):
@@ -18,32 +20,90 @@ SESSION = requests.session()
 # creating an user raises: 'You cannot create a new user from here.
 #  To create new user please go to configuration panel.'
 
+"""BASE_MODEL_PREFIX = ['ir.', 'mail.', 'base.', 'bus.', 'report.', 'res.users', 'stock.location', 'res.',
+                     'product.pricelist', 'stock.picking.type','uom.','crm.team', 'stock.warehouse', 'stock.picking']"""
 BASE_MODEL_PREFIX = ['ir.', 'mail.', 'base.', 'bus.', 'report.', 'account.', 'res.users', 'stock.location', 'res.',
                      'product.pricelist', 'product.product', 'stock.picking.type','uom.','crm.team', 'stock.warehouse', 'stock.picking']
 # todo: add bool field on migration.model like use_same_id
 #MODELS_WITH_EQUAL_IDS = ['res.partner', 'product.product', 'product.template', 'product.category', 'seller.instance', 'uom.uom', 'res.users']
 MODELS_WITH_EQUAL_IDS = []
+
+#MODELS_WITH_EQUAL_IDS = ['res.partner', 'seller.instance', 'uom.uom', 'res.users', 'event.event']
 WITH_AUTO_PROCESS = ['sale.order', 'purchase.order', 'update_product_template_costs', 'account.invoice', 'stock.picking']
 COMPUTED_FIELDS_TO_READ = ['invoice_ids']
 
+
+INTEGRITY_HASH_MIGRATION_FIELDS = ('model', 'old_id', 'new_id', 'data')
+
 class MigrationRecord(models.Model):
     _name = 'migration.record'
+    _description = "Module for Record model of migrations"
+
     name = fields.Char()
     model = fields.Char(index=True)
     old_id = fields.Integer(index=True)
     new_id = fields.Integer(index=True)
     company_id = fields.Many2one('res.company', related='migration_model.company_id')
     data = fields.Text(help='Old data in JSON format')
-    state = fields.Selection([('pending', 'Pending'),('done','Done'),('error', 'Error'),('by_system', 'Created by sistem')])
+    state = fields.Selection([('pending', 'Pending'),('done','Done'),('error', 'Error'),('by_system', 'Created by system'),('updated','Updated')])
     migration_model =  fields.Many2one('migration.model')
     state_message = fields.Text()
     type = fields.Char()
     relation = fields.Char()
 
+    # ==== Hash Fields ====
+    #secure_sequence_number = fields.Integer(string="Inalteralbility No Gap Sequence #", readonly=True, copy=False)
+    inalterable_hash = fields.Char(string="Inalterability Hash", readonly=True, copy=False)
+    string_to_hash = fields.Char(compute='_compute_string_to_hash', readonly=True)
+
+
+    def write(self, vals):
+        res = super(MigrationRecord, self).write(vals)
+        for record in self.filtered(lambda m: m.new_id).sorted(lambda m: (m.model, m.name or '', m.id)):
+            #new_number = record.journal_id.secure_sequence_id.next_by_id()
+            vals_hashing = {
+                    #'secure_sequence_number': new_number,
+                     'inalterable_hash': record._get_new_hash()
+            }
+            res |= super(MigrationRecord, record).write(vals_hashing)
+        return res
+
+    def _get_new_hash(self):
+        """ Returns the hash to write on journal entries when they get posted"""
+        self.ensure_one()
+        #build and return the hash
+        return self._compute_hash()
+
+    def _compute_hash(self):
+        """ Computes the hash of the browse_record given as self"""
+        self.ensure_one()
+        hash_string = sha256((self.string_to_hash).encode('utf-8'))
+        return hash_string.hexdigest()
+
+    def _compute_string_to_hash(self):
+        def _getattrstring(obj, field_str):
+            field_value = obj[field_str]
+            if obj._fields[field_str].type == 'many2one':
+                field_value = field_value.id
+            return str(field_value)
+
+        for record in self:
+            values = {}
+            for field in INTEGRITY_HASH_MIGRATION_FIELDS:
+                values[field] = _getattrstring(record, field)
+
+            record.string_to_hash = dumps(values, sort_keys=True,
+                                                ensure_ascii=True, indent=None,
+                                                separators=(',',':'))
+
+
     def map_record(self):
         if self.new_id:
             return self.new_id
         model = self.migration_model.model or self.model
+        """if model == 'event.event.ticket':
+            company_id = 0
+        else:"""
         company_id = self.company_id.id
         if not model:
             raise ValidationError('Model is required')
@@ -53,6 +113,7 @@ class MigrationRecord(models.Model):
             data = json.loads(self.data)
         new_id = self.get_new_id(model, self.old_id, company_id=company_id, create=False)
         if new_id:
+            self.write({'new_id': new_id, 'model': model, 'state': 'done', })
             return new_id
         name_data = data.get(self.migration_model.alternative_name or 'name')
         name = self.name
@@ -62,31 +123,43 @@ class MigrationRecord(models.Model):
         has_complete_name = hasattr(res_model, alternative_name)
         if self.migration_model.match_records_by_name and (has_name or has_complete_name) and name:
             domain = [(alternative_name if has_complete_name else 'name', '=', name_data if name_data else name)]
+            if self.migration_model.betwen_name_and_alternative:
+                domain = ["|", ("name", "=", name), (alternative_name, '=', name_data)]
             has_company = hasattr(res_model, 'company_id')
-            if has_company and company_id:
+            if has_company and company_id and company_id != 0:
                 domain.append(('company_id', '=', company_id))
 
             new_rec = res_model.search(domain, limit=1).id
             if new_rec:
-                self.write({'new_id': new_rec, 'model': model, 'state': 'done', })
+                self.write({'new_id': new_rec, 'model': model, 'state': 'done',})
                 return new_rec
 
-    def get_new_id(self, model, old_id, test=False, company_id=0, create=True):
+    def get_new_id(self, model, old_id, test=False, company_id=0, create=True, update=False):
+        if update:
+            create = False
         domain = [('model', '=', model), ('old_id', '=', old_id)]
         company_id = company_id or self.company_id.id
+        """if model == 'event.event.ticket':
+            company_id = 0"""
+        #update = False
         if company_id:
             domain += ['|', ('company_id', '=', company_id), ('company_id', '=', False)]
         rec = self.search(domain)
         rec_new_id = rec.filtered(lambda r: r.new_id)
-        if rec_new_id:
+        if rec_new_id and not update:
+            """if self.migration_model.update_records:
+                update = True
+            else:"""
             return rec_new_id[0].new_id
         if len(rec) > 1:
             rec = rec[0]
-        if rec.data and create:
+        if rec.data and (create or update):
             data = json.loads(rec.data)
             if company_id and data.get('company_id'):
                 data['company_id'] = rec.company_id
-            return rec.get_or_create_new_id(data, field_type=rec.type, relation=model, test=test, company_id=company_id)
+            return rec.get_or_create_new_id(data, field_type=rec.type, relation=model,
+                #flag_try_old_id=False,
+                test=test, company_id=company_id)
         return 0
 
     def prepare_vals(self, data=None, fields_mapping=None, model='', test=False, company_id=0, migration_model=None):
@@ -101,19 +174,27 @@ class MigrationRecord(models.Model):
         vals = {}
         migration_model = migration_model or self.migration_model
         in_status = migration_model.import_in_state
+        """if migration_model.model == 'event.event.ticket':
+            company_id = 0
+        else:"""
         company_id = company_id or self.company_id.id or migration_model.company_id.id
         omit_fields = migration_model.omit_fields.split(',') if migration_model.omit_fields else []
-
+        include_fields = migration_model.include_fields.split(',') if migration_model.include_fields else []
         for key in data:
             field_map = fields_mapping.get(key) or {}
             if not field_map or key in omit_fields:
                 # Field does not exist in new odoo
+                continue
+            if key not in include_fields:
                 continue
             if key in ('id', 'display_name'):
                 continue
             if key == 'company_id' and company_id:
                 vals[key] = company_id
                 continue
+            """if migration_model.model == 'event.event.ticket':
+                vals.pop('company_id')
+                company_id = 0"""
             if in_status and key == 'state':
                 vals[key] = in_status
                 continue
@@ -126,6 +207,9 @@ class MigrationRecord(models.Model):
                 if field_type == 'many2one':
                     # value is a tuple with (id, name)
                     try:
+                        """if migration_model.model == 'event.event.ticket':
+                            new_id = self.browse().get_or_create_new_id(value, field_map=field_map, test=test)
+                        else:"""
                         new_id = self.browse().get_or_create_new_id(value, field_map=field_map, test=test, company_id=company_id)
                         if new_id:
                             vals[key] = new_id
@@ -153,7 +237,6 @@ class MigrationRecord(models.Model):
             else:
                 # simple value, int, str
                 vals[key] = value
-        
         if model == 'ir.attachment':
             try:
                 access_token = data.get('access_token') or ''
@@ -166,7 +249,56 @@ class MigrationRecord(models.Model):
                 _log.error(e)
         return vals
 
-    def get_or_create_new_id(self, value=None, field_map=False,  field_type='', relation='', flag_try_old_id=False, test=False, company_id=0, force_create=False):
+    def recompute_computed_fields(self, rec=None):
+        if self.model == 'res.partner' and rec:
+            rec._compute_category_id()
+
+    def update_existing_record(self, test=False):
+        if self.data:
+            value = json.loads(self.data)
+        else:
+            return 0
+        old_id = self.old_id
+        relation = self.model
+        res_model = self.env[relation]
+        rec = 0
+        company_id = self.migration_model.company_id.id
+        if self.migration_model.update_records and self.new_id:
+            domain = [('id', '=', self.new_id)]
+            rec = res_model.search(domain, limit=1)
+            if rec and old_id:
+                # fetch data from old server
+                try:
+                    migration_domain = [('model', '=', relation)]
+                    if company_id and not self.migration_model.model == 'event.event.ticket':
+                        migration_domain += ['|', ('company_id', '=', company_id), ('company_id', '=', False)]
+                    migration_model = self.migration_model.search(migration_domain, limit=1)
+                    if migration_model:
+                        if not migration_model.old_fields_list:
+                            migration_model.compute_fields_mapping()
+                        fields_to_read = json.loads(migration_model.old_fields_list)
+                        fields_to_read.append('display_name')
+                        old_model = migration_model.conn().env[relation]
+                        data = old_model.search_read([('id', '=', old_id)], fields_to_read)
+                        if data:
+                            vals = self.prepare_vals(data[0], model=relation, company_id=company_id, migration_model=migration_model)
+                            #_log.info(vals)
+                            if self.data != json.dumps(vals):
+                                rec = rec.update(vals)
+                                self.recompute_computed_fields(rec)
+                                self.update({
+                                    'data': json.dumps(vals),
+                                    'state': 'updated',
+                                })
+                except Exception as e:
+                    if test:
+                        self.env.cr.rollback()
+                    else:
+                        self.env.cr.commit()
+                    _log.exception(e)
+        return rec
+
+    def get_or_create_new_id(self, value=None, field_map=False,  field_type='', relation='', flag_try_old_id=False, test=False, company_id=0, force_create=False, update=False):
         """
         :param flag_try_old_id:
         :param field_map: dict with keys: name, type, required, relation, etc
@@ -174,9 +306,12 @@ class MigrationRecord(models.Model):
         :raises: Exeption if fail creating record
         :return int
         """
-        
+        """if self.migration_model.model == 'event.event.ticket':
+            company_id = 0
+        else:"""
         company_id = company_id or self.migration_model.company_id.id
         migration_model = False
+        #update = self.migration_model.update_records
         if self.new_id:
             return self.new_id
         if field_map:
@@ -194,6 +329,7 @@ class MigrationRecord(models.Model):
         res_model = self.env[relation]
         has_name = hasattr(res_model, 'name')
         has_complete_name = hasattr(res_model, alternative_name)
+        #new_rec = self.new_id or 0
         new_rec = 0
         old_id = self.old_id
         raw_vals = False
@@ -202,16 +338,19 @@ class MigrationRecord(models.Model):
             old_id = value[0]
             name = value[1]
             # if field map we can try to create the record here
-            id = self.get_new_id(relation, old_id, company_id=company_id, create=bool(field_map))
+            #if not new_rec or new_rec == 0:
+            id = self.get_new_id(relation, old_id, company_id=company_id, create=bool(field_map), update=update)
             if id:
                 return id
         elif isinstance(value, dict):
             old_id = value.get('id') or self.old_id
             name = value.get('name')
             raw_vals = value
-            id = self.get_new_id(relation, old_id, create=bool(field_map))
+            #if not new_rec or new_rec == 0:
+            id = self.get_new_id(relation, old_id, create=bool(field_map), update=update)
             if id:
                 return id
+                
         if (not self.migration_model or self.migration_model.match_records_by_name) and (has_name or has_complete_name) and name:
             domain = [(alternative_name if has_complete_name else 'name', '=', name)]
             has_company = hasattr(res_model, 'company_id')
@@ -219,11 +358,49 @@ class MigrationRecord(models.Model):
             if has_company and company_id:
                 rec_no_company = res_model.search(domain + [('company_id', '=', False)], limit=1).id
                 domain.append(('company_id', '=', company_id))
-            new_rec = res_model.search(domain, limit=1).id
+            new_rec = res_model.search(domain, limit=1)
             if not new_rec and rec_no_company:
                 new_rec = rec_no_company
         if not new_rec and flag_try_old_id:
-            new_rec = res_model.browse(old_id).exists().id
+            new_rec = res_model.browse(old_id).exists()
+        """if self.migration_model.update_records and self.new_id:
+            domain = [('id', '=', self.new_id)]
+            new_rec = res_model.search(domain, limit=1)
+            if new_rec:
+                if raw_vals:
+                    vals = self.prepare_vals(raw_vals, model=relation, company_id=company_id)
+                    try:
+                        #new_rec = res_model.write(vals).id
+                        new_rec = new_rec.write(vals)
+                    except Exception as e:
+                        if test:
+                            self.env.cr.rollback()
+                        else:
+                            self.env.cr.commit()
+                        _log.exception(e)
+                elif old_id:
+                    # fetch data from old server
+                    try:
+                        migration_domain = [('model', '=', relation)]
+                        if company_id and not self.migration_model.model == 'event.event.ticket':
+                            migration_domain += ['|', ('company_id', '=', company_id), ('company_id', '=', False)]
+                        migration_model = self.migration_model.search(migration_domain, limit=1)
+                        if migration_model:
+                            if not migration_model.old_fields_list:
+                                migration_model.compute_fields_mapping()
+                            fields_to_read = json.loads(migration_model.old_fields_list)
+                            fields_to_read.append('display_name')
+                            old_model = migration_model.conn().env[relation]
+                            data = old_model.search_read([('id', '=', old_id)], fields_to_read)
+                            if data:
+                                vals = self.prepare_vals(data[0], model=relation, company_id=company_id, migration_model=migration_model)
+                                new_rec = new_rec.write(vals)
+                    except Exception as e:
+                        if test:
+                            self.env.cr.rollback()
+                        else:
+                            self.env.cr.commit()
+                        _log.exception(e)"""
         if not new_rec:
             omit = self.migration_model.only_fetch_data or ((relation and [True for r in BASE_MODEL_PREFIX if relation.startswith(r)]))
             allowed = force_create
@@ -233,20 +410,22 @@ class MigrationRecord(models.Model):
             if raw_vals:
                 vals = self.prepare_vals(raw_vals, model=relation, company_id=company_id)
                 try:
-                    # if vals.get('notified_partner_ids'):
-                    #     del vals['notified_partner_ids']
-                    new_rec = res_model.create(vals).id
+                    """if update and new_rec:
+                        new_rec = res_model.write(vals).id
+                    else:"""
+                    new_rec = res_model.with_context(no_vat_validation=True,force_create=True).create(vals)
                 except Exception as e:
                     if test:
                         self.env.cr.rollback()
                     else:
                         self.env.cr.commit()
                     _log.exception(e)
+                self.recompute_computed_fields(new_rec)
             elif old_id:
                 # fetch data from old server
                 try:
                     migration_domain = [('model', '=', relation)]
-                    if company_id:
+                    if company_id and not self.migration_model.model == 'event.event.ticket':
                         migration_domain += ['|', ('company_id', '=', company_id), ('company_id', '=', False)]
                     migration_model = self.migration_model.search(migration_domain, limit=1)
                     if migration_model:
@@ -258,22 +437,30 @@ class MigrationRecord(models.Model):
                         data = old_model.search_read([('id', '=', old_id)], fields_to_read)
                         if data:
                             vals = self.prepare_vals(data[0], model=relation, company_id=company_id, migration_model=migration_model)
-                            new_rec = res_model.create(vals).id
+                            """if update and new_rec:
+                                new_rec = res_model.write(vals).id
+                            else:
+                                #new_rec = res_model.create(vals).id"""
+                            new_rec = res_model.with_context(force_create=True).create(vals)
                     elif name:
-                        new_rec = res_model.create({'name': name}).id
+                        """if update and new_rec:
+                            new_rec = res_model.write(vals).id
+                        else:"""
+                        new_rec = res_model.create({'name': name})
                 except Exception as e:
                     if test:
                         self.env.cr.rollback()
                     else:
                         self.env.cr.commit()
                     _log.exception(e)
+                self.recompute_computed_fields(new_rec)
         if new_rec and old_id:
             try:
                 if self.exists():
-                    self.write({'new_id': new_rec, 'model': relation, 'state': 'done', 'type': field_type,
+                    self.write({'new_id': new_rec.id, 'model': relation, 'state': 'done', 'type': field_type,
                                 'relation': relation})
                 else:
-                    vals_to_create = {'new_id': new_rec, 'model': relation, 'old_id': old_id, 'state': 'done', 'type': field_type, 'relation': relation}
+                    vals_to_create = {'new_id': new_rec.id, 'model': relation, 'old_id': old_id, 'state': 'done', 'type': field_type, 'relation': relation}
                     if migration_model:
                         vals_to_create['migration_model'] = migration_model.id
                     self.create([vals_to_create])
@@ -288,6 +475,8 @@ class MigrationRecord(models.Model):
 
 class MigrationCredentials(models.Model):
     _name = 'migration.credentials'
+    _description = "Model for credentials migrations"
+
     database = fields.Char()
     url = fields.Char()
     port = fields.Char()
@@ -296,9 +485,59 @@ class MigrationCredentials(models.Model):
     protocol = fields.Selection([('jsonrpc', 'jsonrpc'),('jsonrpc+ssl', 'jsonrpc+ssl')], 'Protocol')
 
 
+class MigrationOldFields(models.Model):
+    _name = 'migration.oldfields'
+    _description = "Old Fields"
+    
+    #credentials_id = fields.Many2one('migration.credentials')
+    name = fields.Char('name', store=True)
+    #field_name = fields.Char('name')
+    model = fields.Char('model', store=True)
+    #migration_model_id = fields.Many2one('migration.model')
+
+    """def conn(self):
+        rpc_conn = odoorpc.ODOO(self.credentials_id.url, port=self.credentials_id.port, protocol=self.credentials_id.protocol)
+        rpc_conn.login(self.credentials_id.database, self.credentials_id.user, self.credentials_id.password)
+        return rpc_conn
+
+    def get_model_fields(self, model):
+        migration_model_obj = self.env['migration.model']
+        for rec in self:
+            conn = migration_model_obj.conn()
+            try:
+                res_model = self.env[model]
+                if res_model._transient:
+                    return
+            except KeyError:
+                res_model = conn.env[model]
+
+            old_res_model = conn.env[model]
+            old_model_fields = old_res_model.fields_get()
+            records_list = []
+            return_list = []
+            if old_model_fields:
+                existing_records = self.search([('model', '=', model)])
+                for record in existing_records:
+                    #comb_name = record.name + ' ' + record.model
+                    records_list.append(record.name)
+                    return_list.append(record)
+                for field in old_model_fields:
+                    #name_comb = field + ' ' + model
+                    if field not in records_list:
+                        new_field = self.create({'name': field,
+                            'model': model
+                        })
+                        records_list.append(field)
+                        return_list.append(new_field)
+            return return_list
+            #return True"""
+
 class MigrationModel(models.Model):
     _name = 'migration.model'
     _order = 'sequence'
+    _description = "Model for migration model version"
+
+
     name = fields.Char()
     state = fields.Selection([
         ('draft','Draft'),
@@ -308,7 +547,7 @@ class MigrationModel(models.Model):
         ('importing', 'Importing Data'),
         ('done', 'Done'),
         ('error', 'Error')], default='draft')
-    sequence = fields.Integer(default=1000)
+    sequence = fields.Integer(default=100)
     credentials_id = fields.Many2one('migration.credentials')
     model = fields.Char()
     company_id = fields.Many2one('res.company', help="company to import records")
@@ -317,12 +556,12 @@ class MigrationModel(models.Model):
     date_to = fields.Date()
     record_states = fields.Char(help='state of records to migrate separated by ,')
     fields_mapping = fields.Text(
-        stored=True,
+        store=True,
         help='JSON object key:object where key is old field name and value the new one, add all fields you want to migrate')
     only_fetch_data = fields.Boolean()
     threads = fields.Integer(help='for parallel workers, if it\'s 0 will execute synchronous')
     migration_record_ids = fields.One2many('migration.record', 'migration_model')
-    status_message = fields.Text(stored=True)
+    status_message = fields.Text(store=True)
     import_in_state = fields.Char()
     read_one2many_fields = fields.Boolean()
     match_records_by_name = fields.Boolean(help="If true will match records by name or complete name", default=True)
@@ -333,8 +572,10 @@ class MigrationModel(models.Model):
     current_deep_level = fields.Integer(help="the current level for this model", default=1)
     parent_id = fields.Many2one('migration.model')
     relation_field = fields.Char()
-    dependency_ids = fields.One2many('migration.model', 'parent_id', ondelete='cascade')
+    dependency_ids = fields.One2many('migration.model', 'parent_id')
+        #, ondelete='cascade')
     omit_fields = fields.Char(help="fields to omit separated by ,")
+    include_fields = fields.Char(help="fields to include separated by ,")
     old_fields_list = fields.Text()
     # Computed fields
     fetch_records = fields.Integer(compute='_compute_progress')
@@ -343,13 +584,116 @@ class MigrationModel(models.Model):
     migration_progress = fields.Integer(compute='_compute_progress')
     has_auto_process = fields.Boolean(compute='_compute_progress')
     alternative_name = fields.Char(default="complete_name",help="other name to map records must be a valid field on the model")
+    betwen_name_and_alternative = fields.Boolean(default=False,
+                                                 help="Check to change the domain from alternative name and name to or")
+    include_or_exclude = fields.Selection([('include','Include'),('exclude','Exclude')], string='Include or Exclude Fields', default='include')
+    old_fields_ids = fields.Many2many('migration.oldfields', 'migration_model_migration_oldfields_rel', string='Fields')
+    update_records = fields.Boolean(string='Update Records from old Server')
+    """old_model_fields = fields.Char(string='Old Model fields', compute='')"""
+    """old_fields_ids = fields.One2many('migration.oldfields', 'migration_model_id', comodel_name='event.registration', inverse_name="attendee_partner_id",
+        domain=[('event_begin_date','>=',((datetime.datetime.now()-relativedelta(years=2)).strftime('%Y-01-01'))),('event_begin_date','<=',(datetime.datetime.now()+relativedelta(years=2)).strftime('%Y-12-31'))])"""
+    
 
     # temporal fields
     account_id = fields.Many2one('account.account')
 
-    def compute_fields_mapping(self, dependencies=[]):
-        for rec in self:
+    def update_record(self):
+        conn = self.conn()
+        new_model = conn.env[self.model]
+        domain = json.loads(self.extra_domain)
+        fields_to_read = json.loads(self.old_fields_list)
+        registers = new_model.search(domain)
+        for rec in registers:
+            datos = new_model.browse(rec)
+            data = datos.default_code
+            if data:
+                code = str(data)
+                code = code.replace('[', '')
+                code = code.replace(']', '')
+                code = code.strip()
+                datos.default_code = code
+
+
+    def _valid_field_parameter(self, field, name):
+        return name in ['stored', 'ondelete'] or super()._valid_field_parameter(field, name)
+
+
+    @api.onchange('old_fields_ids')
+    def _onchange_old_fields_ids(self):
+        if self.old_fields_ids:
+            old_field_names = []
+            if self.include_or_exclude == 'include':
+                include = []
+                if self.include_fields:
+                    include = self.include_fields.split(',')
+                fields_list = include
+                fields_field = self.include_fields
+            else:
+                omit = []
+                if self.omit_fields:
+                    omit = self.omit_fields.split(',')
+                fields_list = omit
+                fields_field = self.omit_fields
+            #old_fields = self.browse(self.old_fields_ids.ids)
+            old_fields = self.env['migration.oldfields'].search([('id', 'in', self.old_fields_ids.ids)])
+            for old_field in old_fields:
+                if old_field.name and old_field.name not in fields_list:
+                    if fields_field:
+                        fields_field = fields_field + ',' + old_field.name
+                    else:
+                        fields_field = old_field.name
+                old_field_names.append(old_field.name)
+                if self.include_or_exclude == 'include':
+                    self.include_fields = fields_field
+                else:
+                    self.omit_fields = fields_field
+            for incl_field in fields_list:
+                if incl_field not in old_field_names:
+                    incl_fields = fields_field
+                    repl_field = ',' + incl_field
+                    if self.include_or_exclude == 'include':
+                        self.include_fields = incl_fields.replace(repl_field, '')
+                    else:
+                        self.omit_fields = incl_fields.replace(repl_field, '')
+
+    @api.onchange('model')
+    def _onchange_model(self):
+        #self.old_fields_ids = [(6, 0, [])]
+        if self.model and self.model != '' and self.credentials_id:
+            #self.old_fields_ids = self.env['migration.oldfields'].get_model_fields(self.model)
+            oldfields_obj = self.env['migration.oldfields']
+            #for rec in self:
+            conn = self.conn()
             try:
+                res_model = self.env[self.model]
+                if res_model._transient:
+                    return
+            except KeyError:
+                res_model = conn.env[self.model]
+
+            old_res_model = conn.env[self.model]
+            old_model_fields = old_res_model.fields_get()
+            records_list = []
+            return_list = []
+            if old_model_fields:
+                existing_records = oldfields_obj.search([('model', '=', self.model)])
+                for record in existing_records:
+                    #comb_name = record.name + ' ' + record.model
+                    records_list.append(record.name)
+                    return_list.append(record)
+                for field in old_model_fields:
+                    #name_comb = field + ' ' + model
+                    if field not in records_list:
+                        #and field not in return_list:
+                        new_field = oldfields_obj.create({'name': field,
+                        'model': self.model
+                        })
+                        records_list.append(field)
+                        return_list.append(new_field)
+                #self.old_fields_ids
+            #return return_list
+
+    """def compute_old_model_fields(self):
                 omit_fields = []
                 if self.omit_fields:
                     omit_fields = self.omit_fields.split(',')
@@ -363,14 +707,37 @@ class MigrationModel(models.Model):
 
                 old_res_model = conn.env[rec.model]
                 old_model_fields = old_res_model.fields_get()
+                model_fields = res_model.fields_get() if not self.only_fetch_data else old_model_fields"""
+
+    def compute_fields_mapping(self, dependencies=[]):
+        for rec in self:
+            try:
+                omit_fields = []
+                if self.omit_fields:
+                    omit_fields = self.omit_fields.split(',')
+                include_fields = []
+                if self.include_fields:
+                    include_fields = self.include_fields.split(',')
+                conn = self.conn()
+                try:
+                    res_model = self.env[rec.model]
+                    if res_model._transient:
+                        return
+                except KeyError:
+                    res_model = conn.env[rec.model]
+
+                old_res_model = conn.env[rec.model]
+                old_model_fields = old_res_model.fields_get()
                 model_fields = res_model.fields_get() if not self.only_fetch_data else old_model_fields
-                stored_fields = [f for f in model_fields if model_fields[f].get('store', True) or f in COMPUTED_FIELDS_TO_READ]
+                #stored_fields = [f for f in model_fields if model_fields[f].get('store', True) or f in COMPUTED_FIELDS_TO_READ]
                 old_fields_list = []
                 fields_mapping = {}
                 if not dependencies:
                     dependencies = rec.dependency_ids.search(['|', ('company_id', '=', rec.company_id.id), ('company_id','=', False)]).mapped('model')
-                for field in stored_fields:
+                for field in model_fields:
                     if field in omit_fields:
+                        continue
+                    if self.include_or_exclude == 'include' and field not in include_fields:
                         continue
                     new_field = model_fields[field]
                     if new_field.get('type') == 'one2many' and not rec.read_one2many_fields:
@@ -392,8 +759,8 @@ class MigrationModel(models.Model):
                         'recursive': recursive,
                     }
                     omit = relation and [True for r in BASE_MODEL_PREFIX if relation.startswith(r)]
-                    if omit:
-                        continue
+                    #if omit:
+                    #    continue
                     if relation and recursive and relation not in dependencies and relation != rec.model and rec.current_deep_level < rec.max_deep_level:
                         dep_vals = {
                             'name': relation,
@@ -431,6 +798,8 @@ class MigrationModel(models.Model):
             rec.fetch_progress = rec.total_records and (rec.fetch_records / rec.total_records) * 100
             rec.migrated_records = self.migration_record_ids.search_count([('migration_model', '=', rec.id), ('state', '=', 'done')])
             rec.migration_progress = rec.total_records and (rec.migrated_records / rec.total_records) * 100
+            #if rec.migration_progress == 100:
+            #    rec.state = 'done'
 
     def conn(self):
         rpc_conn = odoorpc.ODOO(self.credentials_id.url, port=self.credentials_id.port, protocol=self.credentials_id.protocol)
@@ -440,10 +809,26 @@ class MigrationModel(models.Model):
     def set_draft(self):
         for rec in self:
             rec.state = 'draft'
+            if rec.migration_record_ids:
+                records = (rec.migration_record_ids).filtered(lambda r: r.state == 'updated')
+                if records:
+                    for record in records:
+                        record.update({
+                            'state': 'done'
+                        })
+
+    def set_to_fetch(self):
+        for rec in self:
+            rec.state = 'to_fetch'
+
 
     def set_ready(self):
         for rec in self:
             rec.state = 'ready'
+
+    def set_done(self):
+        for rec in self:
+            rec.state = 'done'
 
     def run_test(self, show_confirmation=True):
         try:
@@ -489,15 +874,26 @@ class MigrationModel(models.Model):
     #@job
     def run_import_batch(self, migration_record_ids, test=False):
         sql_errors = 0
-        records = migration_record_ids.filtered(lambda r: not r.new_id)
+        if self.update_records:
+            records = migration_record_ids.filtered(lambda r: r.new_id)
+        else:
+            records = migration_record_ids.filtered(lambda r: not r.new_id)
         chunks = get_chunks(records, 100)
         for chunk in chunks:
             for rec in chunk:
                 try:
                     rec.map_record()
                     if rec.new_id:
-                        continue
-                    new_obj = rec.get_or_create_new_id(test=test, force_create=True)
+                        #_log.info(rec.new_id)
+                        #continue
+                        """rec.get_or_create_new_id(
+                            test=test,
+                            #force_create=True,
+                            update=True
+                            )"""
+                        rec.update_existing_record(test=test)
+                    else:
+                        new_obj = rec.get_or_create_new_id(test=test, force_create=True)
                 except Exception as e:
                     _log.exception(e)
                     if test:
@@ -797,19 +1193,20 @@ class MigrationModel(models.Model):
                     continue
                 old_state = old_data.get('state')
                 old_date = old_data.get('date_order')
-                if old_state not in ('sale', 'purchase', 'done'):
+                if old_state not in ('sale', 'purchase', 'done', 'locked'):
                     _log.warning('order was in state %s' % old_state)
                     continue
                 # Validate the order
                 if self.model == 'sale.order':
                     so.action_confirm()
+                    so.with_context(force_validate_wihout_delivery_method=True).action_confirm()
                     so.date_order = old_date
                 elif self.model == 'purchase.order':
                     so.button_confirm()
                     so.date_approve = old_date
                 else:
                     raise NotImplementedError(self.model)
-                # get old delivery data
+                """# get old delivery data
                 old_sp_ids = old_data.get('picking_ids')
                 sp_date = old_date
                 if not old_sp_ids:
@@ -849,7 +1246,7 @@ class MigrationModel(models.Model):
                     sp.action_done()
                     sp.date_done = sp_date
                     # write the sp_id to old sp_rec
-                    sp_rec.update({'new_id': sp.id, 'state': 'done'})
+                    sp_rec.update({'new_id': sp.id, 'state': 'done'})"""
                 invoices = False
                 # create and validate invoice
                 if old_data.get('invoice_ids'):
@@ -1017,40 +1414,93 @@ class MigrationModel(models.Model):
                 new_model = conn.env[self.model]
             old_model = conn.env[self.model]
             domain = []
-            if self.old_company_id and hasattr(new_model, 'company_id'):
+            if self.old_company_id and hasattr(new_model, 'company_id') and hasattr(old_model, 'company_id') and self.model != 'event.event.ticket':
                 domain.append(('company_id', '=', self.old_company_id))
             if self.record_states and hasattr(new_model, 'state'):
                 states = self.record_states.split(',')
                 domain.append(('state', 'in', states))
             if self.date_from:
-                domain.append(('create_date', '>=', str(self.date_from)))
+                if self.model == 'event.event.ticket':
+                    domain.append(('event_id.date_begin', '>=', str(self.date_from)))
+                elif self.model == 'event.event':
+                    domain.append(('date_begin', '>=', str(self.date_from)))
+                else:
+                    domain.append(('create_date', '>=', str(self.date_from)))
             if self.date_to:
-                domain.append(('create_date', '<', str(self.date_to)))
-            if self.migration_record_ids:
-                domain.append(('id', 'not in', self.migration_record_ids.mapped('old_id')))
+                if self.model == 'event.event.ticket':
+                    domain.append(('event_id.date_begin', '<', str(self.date_to)))
+                elif self.model == 'event.event':
+                    domain.append(('date_begin', '<', str(self.date_to)))
+                else:
+                    domain.append(('create_date', '<', str(self.date_to)))
             if self.extra_domain:
                 extra_domain = json.loads(self.extra_domain)
                 domain += extra_domain
             fields_to_read = json.loads(self.old_fields_list)
             fields_to_read.append('display_name')
             old_records = old_model.search(domain, limit=limit)
-            self.total_records = self.total_records + len(old_records)
-            chunks = get_chunks(old_records)
-            dependencies = self.dependency_ids.search([('state', '=', 'to_fetch'), ('id', '!=', self.id)])
-            for dep in dependencies:
-                if dep.state == 'to_fetch':
-                    dep.prepare_records_from_old_server(run_import=False, test=test)
-            for batch in chunks:
-                data = old_model.search_read([('id', 'in', batch)], fields_to_read)
-                self.migration_record_ids = [[0, 0, {
-                    'old_id': d.get('id'),
-                    'data': json.dumps(d),
-                    'model': self.model,
-                    'name': d.get('display_name'),
-                    'state': 'pending',
-                }] for d in data]
-                if not test:
-                    self.env.cr.commit()
+            new_records = ''
+            records_to_update = ''
+            update_domain = domain
+            if self.migration_record_ids:
+                domain.append(('id', 'not in', self.migration_record_ids.mapped('old_id')))
+                new_records = old_model.search(domain, limit=limit)
+                if self.update_records:
+                    update_domain.append(('id', 'in', self.migration_record_ids.mapped('old_id')))
+                    records_to_update = old_model.search(update_domain, limit=limit)
+                self.total_records = self.total_records + len(new_records)
+                old_records = new_records
+            else:
+                self.total_records = self.total_records + len(old_records)
+            if self.update_records and records_to_update:
+                #old_records = new_records
+                chunks = get_chunks(records_to_update)
+                for batch in chunks:
+                    #data = old_model.search_read([('id', 'in', batch)], fields_to_read)
+                    batch_domain = [('id', 'in', batch)]
+                    batch_domain += [dm for dm in update_domain if dm[0]=='active']
+                    data = old_model.search_read(batch_domain, fields_to_read)
+                    migr_rec_obj = self.env['migration.record']
+                    #self.migration_record_ids.mapped('old_id')
+                    for d in data:
+                        migr_rec_id = migr_rec_obj.search([
+                            ('old_id', '=', d.get('id'))
+                            ], limit=1)
+                        if migr_rec_id:
+                            """self.migration_record_ids = [1, migr_rec_id.id, {
+                            'old_id': d.get('id'),
+                            'data': json.dumps(d),
+                            'model': self.model,
+                            'name': d.get('display_name'),
+                            'state': 'pending',
+                        }]"""
+                            migr_rec_id.update({
+                                'data': json.dumps(d),
+                                'state': 'pending',
+                            })
+                    if not test:
+                        self.env.cr.commit()
+            #else:
+            if old_records:
+                chunks = get_chunks(old_records)
+                dependencies = self.dependency_ids.search([('state', '=', 'to_fetch'), ('id', '!=', self.id)])
+                for dep in dependencies:
+                    if dep.state == 'to_fetch':
+                        dep.prepare_records_from_old_server(run_import=False, test=test)
+                for batch in chunks:
+                    #data = old_model.search_read([('id', 'in', batch)], fields_to_read)
+                    batch_domain = [('id', 'in', batch)]
+                    batch_domain += [dm for dm in domain if dm[0]=='active']
+                    data = old_model.search_read(batch_domain, fields_to_read)
+                    self.migration_record_ids = [[0, 0, {
+                        'old_id': d.get('id'),
+                        'data': json.dumps(d),
+                        'model': self.model,
+                        'name': d.get('display_name'),
+                        'state': 'pending',
+                    }] for d in data]
+                    if not test:
+                        self.env.cr.commit()
             self.state = 'ready'
             if test:
                 self.env.cr.rollback()
