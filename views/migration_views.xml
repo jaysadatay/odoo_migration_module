@@ -1,6 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <odoo>
     <data>
+        <record id="view_migration_oldfields_tree" model="ir.ui.view">
+            <field name="name">migration.oldfields.tree</field>
+            <field name="model">migration.oldfields</field>
+            <field name="type">tree</field>
+            <field name="arch" type="xml">
+                <tree>
+                    <field name="name" />
+                    <field name="model" />
+                </tree>
+            </field>
+        </record>
         <record id="view_migration_model_tree" model="ir.ui.view">
             <field name="name">migration.model.tree</field>
             <field name="model">migration.model</field>
@@ -10,6 +21,7 @@
                     <field name="sequence"/>
                     <field name="name" />
                     <field name="model" />
+                    <field name="old_fields_ids" invisible="1"/>
                     <field name="state" />
                     <field name="company_id"/>
                     <field name="total_records"/>
@@ -29,14 +41,15 @@
                     <header>
                         <button name="compute_fields_mapping" type="object" string="Compute Fields and Deps" class="btn-primary" invisible="state != 'draft'"/>
                         <button name="map_records" type="object" string="Map Records"/>
-                        <button name="run_test" type="object" string="Test Migration" class="btn-primary" invisible="state != 'to_fetch'" />
-                        <button name="button_fetch" type="object" string="Fetch Data" class="btn-primary" invisible="state != 'to_fetch'" />
-                        <button name="button_start" type="object" string="Start Migration" class="btn-primary" invisible="state != 'to_fetch'" />
+                        <button name="run_test" type="object" string="Test Migration" class="btn-primary" invisible="state != 'to_fetch'"/>
+                        <button name="button_fetch" type="object" string="Fetch Data" class="btn-primary" invisible="state != 'to_fetch'"/>
+                        <button name="button_start" type="object" string="Start Migration" class="btn-primary" invisible="state != 'to_fetch'"/>
                         <button name="run_import_process" type="object" string="Run Import" class="btn-primary" invisible="state != 'ready'"/>
                         <button name="set_draft" type="object" string="Set draft" class="btn-primary" />
                         <button name="set_to_fetch" type="object" string="Set to Fetch" class="btn-primary" />
                         <button name="set_ready" type="object" string="Set Ready" class="btn-primary" invisible="state not in ('error','done','to_fetch')"/>
                         <button name="update_record" type="object" string="Update Record" class="btn-primary"/>
+                        <button name="set_done" type="object" string="Set done" class="btn-primary" />
                         <button name="auto_process" type="object" string="Run Auto Process" invisible="state not in ('draft','done','importing') and has_auto_process == False"/>
                         <field name="state" widget="statusbar"/>
                     </header>
@@ -46,6 +59,14 @@
                         <field name="sequence" readonly="state != 'draft'"/>
                         <field name="credentials_id" readonly="state != 'draft'"/>
                         <field name="model" readonly="state != 'draft'"/>
+                        <field name="update_records"/>
+                        <field name="include_or_exclude" widget="radio"/>
+                        <field name="old_fields_ids" widget="many2many_tags" domain="[('model', '=', model)]"/>
+                            <!--<tree string="Anmeldungen">
+                                <field name="name"/>
+                                <field name="model"/>
+                            </tree>
+                        </field>-->
                         <field name="company_id" readonly="state != 'draft'"/>
                         <field name="old_company_id" readonly="state != 'draft'"/>
                         <field name="only_fetch_data" readonly="state != 'draft'"/>
@@ -57,32 +78,32 @@
                         <field name="match_records_by_name" readonly="state != 'draft'"/>
                         <field name="alternative_name"/>
                         <field name="betwen_name_and_alternative"/>
-                        <field name="archived_record"/>
                         <field name="has_auto_process"/>
 
 
                         <field name="threads" readonly="state != 'draft'"/>
                         <field name="extra_domain" readonly="state != 'draft'"/>
                         <field name="total_records" readonly="state != 'draft'"/>
-                        <field name="fetch_records" readonly="state != 'draft'"/>
-
+                        <field name="fetch_records" readonly="state != 'draft'"/>    
+                        
                         <field name="fetch_progress" readonly="state != 'draft'"/>
                         <field name="migrated_records" readonly="state != 'draft'"/>
                         <field name="migration_progress" readonly="state != 'draft'"/>
                         <field name="status_message" readonly="state != 'draft'"/>
+                        <field name="include_fields"/>
                         <field name="omit_fields"/>
                         <field name="read_one2many_fields" readonly="state != 'draft'"/>
                         <field name="max_deep_level" readonly="state != 'draft'"/>
                         <field name="current_deep_level" readonly="state != 'draft'"/>
                         <field name="parent_id" readonly="state != 'draft'"/>
-                        <field name="relation_field" invisible="parent_id == False" readonly="state != 'draft'"/>
+                        <field name="relation_field" attrs="{'invisible':[('parent_id','=',False)],'readonly': [('state','!=', 'draft')]}"/>
                         <field name="account_id"/>
                         <field name="fields_mapping"  widget="ace" readonly="state != 'draft'"/>
                         <field name="dependency_ids" readonly="state != 'draft'"/>
 
-                        <field name="migration_record_ids" >
-                            <tree decoration-danger="state == 'error'"
-                                  decoration-success="state == 'done'" editable="bottom">
+                        <field name="migration_record_ids">
+                            <tree editable="bottom" decoration-danger="state == 'error'"
+                                  decoration-success="state == 'done'">
                                 <field name="name"/>
                                 <field name="state"/>
                                 <field name="migration_model"/>
@@ -126,7 +147,13 @@
             <field name="res_model">migration.record</field>
             <field name="view_mode">tree,form</field>
         </record>
+        <record model="ir.actions.act_window" id="action_migration_oldfields_menu">
+            <field name="name">Migration Old Fields</field>
+            <field name="res_model">migration.oldfields</field>
+            <field name="view_mode">tree</field>
+        </record>
         <menuitem id="menu_migration" name="Migration Module" parent="base.menu_custom" action="action_migration_menu"/>
         <menuitem id="menu_migration_record" name="Migration Record" parent="base.menu_custom" action="action_migration_record_menu"/>
+        <menuitem id="menu_migration_oldfields" name="Migration Old Fields" parent="base.menu_custom" action="action_migration_oldfields_menu"/>
     </data>
 </odoo>

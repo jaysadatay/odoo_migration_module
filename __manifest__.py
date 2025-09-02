@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 #################################################################################
-# Author      : Anderson Martinez (andersonvidal94@gmail.com)
+# Author      : MeLikeyMedia
 # License     : AGPL-3
 #
 #################################################################################
 {
     'name': 'Migration from other odoo',
     "version": "17.0.0.0",
-    "author": "Anderson Martinez",
-    "maintainer": "Anderson Martinez",
+    "author": "MeLikeyMedia",
+    "maintainer": "MeLikeyMedia",
     'depends': ['account'],
     'external_dependencies': {'python': ['odoorpc']},
     'data': [
