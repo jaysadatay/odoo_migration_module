@@ -125,7 +125,7 @@ class MigrationRecord(models.Model):
             domain = [(alternative_name if has_complete_name else 'name', '=', name_data if name_data else name)]
             if self.migration_model.betwen_name_and_alternative:
                 domain = ["|", ("name", "=", name), (alternative_name, '=', name_data)]
-            has_company = hasattr(res_model, 'company_id'
+            has_company = hasattr(res_model, 'company_id')
             if self.migration_model.archived_record and hasattr(res_model, 'active'):
                 domain.append(('active', 'in', [True, False]))
             if has_company and company_id and company_id != 0:
