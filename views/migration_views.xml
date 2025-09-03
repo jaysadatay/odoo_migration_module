@@ -96,7 +96,7 @@
                         <field name="max_deep_level" readonly="state != 'draft'"/>
                         <field name="current_deep_level" readonly="state != 'draft'"/>
                         <field name="parent_id" readonly="state != 'draft'"/>
-                        <field name="relation_field" attrs="{'invisible':[('parent_id','=',False)],'readonly': [('state','!=', 'draft')]}"/>
+                        <field name="relation_field" invisible="parent_id = False" readonly="state != 'draft'"/>
                         <field name="account_id"/>
                         <field name="fields_mapping"  widget="ace" readonly="state != 'draft'"/>
                         <field name="dependency_ids" readonly="state != 'draft'"/>
